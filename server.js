@@ -1,44 +1,94 @@
 import express from "express";
 import cors from "cors";
-import { v4 as uuidv4 } from "uuid";
+import sharp from "sharp";
+import OpenAI from "openai";
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 
-const projects = {};
+// Increase payload limit because we're sending base64 images
+app.use(express.json({ limit: "15mb" }));
 
-app.post("/projects", (req, res) => {
-  const project_id = uuidv4();
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-  projects[project_id] = {
-    style_id: req.body.style_id,
-    aspect_ratio: req.body.aspect_ratio,
-    status: "created"
-  };
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  res.json({
-    project_id,
-    upload_url: "https://httpbin.org/put"
-  });
-});
+// Simple style map (MVP)
+const STYLE_PROMPTS = {
+  S01: "royal oil painting portrait, rich textures, dramatic lighting",
+  S02: "modern cartoon portrait, clean lines, tasteful colors",
+  S03: "minimal line art portrait, elegant, simple, high contrast",
+  S04: "vintage film portrait, warm grain, soft light",
+  S05: "watercolour portrait, soft washes, artistic texture",
+  S06: "comic book portrait, bold ink lines, halftone shading",
+  S07: "studio portrait, realistic, clean background, softbox lighting",
+  S08: "pop art portrait, bold shapes, modern color blocking"
+};
 
-app.post("/projects/:id/upload-complete", (req, res) => {
-  const { id } = req.params;
+// Watermark helper
+async function watermarkPreview(buf) {
+  const svg = Buffer.from(`
+    <svg width="1200" height="1200">
+      <style>
+        .t { fill: rgba(255,255,255,0.55); font-size: 56px; font-family: Arial, sans-serif; font-weight: 800; }
+      </style>
+      <text x="50%" y="92%" text-anchor="middle" class="t">PREVIEW</text>
+    </svg>
+  `);
 
-  if (!projects[id]) {
-    return res.status(404).json({ error: "Project not found" });
+  return sharp(buf)
+    .resize({ width: 1200, withoutEnlargement: true })
+    .composite([{ input: svg, top: 0, left: 0 }])
+    .jpeg({ quality: 85 })
+    .toBuffer();
+}
+
+/**
+ * POST /preview
+ * body: { image_base64: "...", style_id: "S01" }
+ * returns: { preview_base64: "..." }
+ */
+app.post("/preview", async (req, res) => {
+  try {
+    const { image_base64, style_id } = req.body || {};
+    if (!image_base64) return res.status(400).json({ error: "image_base64 required" });
+    if (!style_id) return res.status(400).json({ error: "style_id required" });
+
+    const prompt = STYLE_PROMPTS[style_id] || "stylized portrait";
+
+    // Decode base64 image (strip any data URL prefix)
+    const cleaned = image_base64.replace(/^data:image\/\w+;base64,/, "");
+    const inputBuf = Buffer.from(cleaned, "base64");
+
+    // Normalize input for model
+    const inputPng = await sharp(inputBuf)
+      .rotate()
+      .resize({ width: 1024, height: 1024, fit: "cover" })
+      .png()
+      .toBuffer();
+
+    // Generate stylized image (API-native)
+    // If your account/model uses a different method, we swap this call.
+    const result = await openai.images.edit({
+      model: "gpt-image-1",
+      image: [{ data: inputPng.toString("base64"), mime_type: "image/png" }],
+      prompt: `Create a high quality portrait in this style: ${prompt}. Keep the subject recognizable. Clean background.`
+    });
+
+    const b64 = result?.data?.[0]?.b64_json;
+    if (!b64) throw new Error("AI response missing image");
+
+    const generatedBuf = Buffer.from(b64, "base64");
+    const watermarked = await watermarkPreview(generatedBuf);
+
+    return res.json({
+      preview_base64: watermarked.toString("base64")
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || "server error" });
   }
-
-  projects[id].status = "preview_ready";
-
-  res.json({
-    preview_url: "https://picsum.photos/600/900"
-  });
 });
 
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log("Server running");
-});
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
