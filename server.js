@@ -69,11 +69,16 @@ app.post("/preview", async (req, res) => {
 
     // Generate stylized image (API-native)
     // If your account/model uses a different method, we swap this call.
-    const result = await openai.images.edit({
-      model: "gpt-image-1",
-      image: [{ data: inputPng.toString("base64"), mime_type: "image/png" }],
-      prompt: `Create a high quality portrait in this style: ${prompt}. Keep the subject recognizable. Clean background.`
-    });
+    const dataUrl = `data:image/png;base64,${inputPng.toString("base64")}`;
+
+const result = await openai.images.generate({
+  model: "gpt-image-1",
+  prompt: `Create a high quality portrait from the provided image in this style: ${prompt}. Keep the subject recognizable. Clean background.`
+  ,
+  // Pass the user photo as the reference image
+  image: dataUrl
+});
+
 
     const b64 = result?.data?.[0]?.b64_json;
     if (!b64) throw new Error("AI response missing image");
