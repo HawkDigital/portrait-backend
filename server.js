@@ -63,17 +63,27 @@ const STYLE_PROMPTS = {
 
 // Watermark helper
 async function watermarkPreview(buf) {
+  // First resize the image
+  const resized = await sharp(buf)
+    .resize({ width: 1200, withoutEnlargement: true })
+    .toBuffer();
+
+  // Get actual dimensions after resize
+  const metadata = await sharp(resized).metadata();
+  const width = metadata.width || 1200;
+  const height = metadata.height || 1200;
+
+  // Create SVG that matches the image dimensions
   const svg = Buffer.from(`
-    <svg width="1200" height="1200">
+    <svg width="${width}" height="${height}">
       <style>
-        .t { fill: rgba(255,255,255,0.55); font-size: 56px; font-family: Arial, sans-serif; font-weight: 800; }
+        .t { fill: rgba(255,255,255,0.55); font-size: 48px; font-family: Arial, sans-serif; font-weight: 800; }
       </style>
       <text x="50%" y="92%" text-anchor="middle" class="t">PREVIEW</text>
     </svg>
   `);
 
-  return sharp(buf)
-    .resize({ width: 1200, withoutEnlargement: true })
+  return sharp(resized)
     .composite([{ input: svg, top: 0, left: 0 }])
     .jpeg({ quality: 85 })
     .toBuffer();
