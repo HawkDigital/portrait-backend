@@ -217,9 +217,9 @@ async function generateStylizedImage(imageBuffer, styleId, background = "BG01") 
         image: dataUrl,
         prompt: prompt,
         negative_prompt: negative_prompt,
-        prompt_strength: 0.65,
-        num_inference_steps: 30,
-        guidance_scale: 7.5
+        prompt_strength: 0.8,
+        num_inference_steps: 35,
+        guidance_scale: 9
       }
     }
   );
