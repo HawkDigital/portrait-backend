@@ -26,7 +26,7 @@ const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
 // ============================================
-// PROMPT CACHE (loaded from Supabase)
+// PROMPT CACHE
 // ============================================
 let promptCache = {
   styles: {},
@@ -36,67 +36,57 @@ let promptCache = {
   lastLoaded: null
 };
 
-// Load prompts from Supabase
 async function loadPrompts() {
   console.log("Loading prompts from Supabase...");
 
   try {
-    // Load styles
-    const { data: styles, error: stylesError } = await supabase
+    const { data: styles } = await supabase
       .from("styles")
       .select("*")
       .eq("active", true)
       .order("sort_order");
 
-    if (stylesError) throw stylesError;
-
     promptCache.styles = {};
-    styles.forEach(s => {
-      promptCache.styles[s.id] = { name: s.name, prompt: s.prompt };
+    styles?.forEach(s => {
+      promptCache.styles[s.id] = {
+        name: s.name,
+        prompt: s.prompt,
+        model: s.model || "photomaker-style",
+        model_params: s.model_params || {}
+      };
     });
 
-    // Load exaggeration levels
-    const { data: exaggeration, error: exagError } = await supabase
+    const { data: exaggeration } = await supabase
       .from("exaggeration_levels")
       .select("*")
       .order("sort_order");
 
-    if (exagError) throw exagError;
-
     promptCache.exaggeration = {};
-    exaggeration.forEach(e => {
+    exaggeration?.forEach(e => {
       promptCache.exaggeration[e.id] = { name: e.name, prompt: e.prompt };
     });
 
-    // Load backgrounds
-    const { data: backgrounds, error: bgError } = await supabase
+    const { data: backgrounds } = await supabase
       .from("backgrounds")
       .select("*")
       .order("sort_order");
 
-    if (bgError) throw bgError;
-
     promptCache.backgrounds = {};
-    backgrounds.forEach(b => {
+    backgrounds?.forEach(b => {
       promptCache.backgrounds[b.id] = { name: b.name, prompt: b.prompt };
     });
 
-    // Load config
-    const { data: config, error: configError } = await supabase
+    const { data: config } = await supabase
       .from("prompt_config")
       .select("*");
 
-    if (configError) throw configError;
-
     promptCache.config = {};
-    config.forEach(c => {
+    config?.forEach(c => {
       promptCache.config[c.key] = c.value;
     });
 
     promptCache.lastLoaded = Date.now();
-
-    console.log(`Prompts loaded: ${Object.keys(promptCache.styles).length} styles, ${Object.keys(promptCache.exaggeration).length} exaggeration levels, ${Object.keys(promptCache.backgrounds).length} backgrounds`);
-
+    console.log(`Prompts loaded: ${Object.keys(promptCache.styles).length} styles`);
     return true;
   } catch (err) {
     console.error("Failed to load prompts:", err);
@@ -104,7 +94,6 @@ async function loadPrompts() {
   }
 }
 
-// Reload prompts every 5 minutes (so changes take effect without restart)
 setInterval(loadPrompts, 5 * 60 * 1000);
 
 // ============================================
@@ -112,41 +101,29 @@ setInterval(loadPrompts, 5 * 60 * 1000);
 // ============================================
 
 function buildPrompt(styleId, exaggeration = "medium", background = "BG01") {
-  const style = promptCache.styles[styleId] || promptCache.styles["S01"] || { prompt: "caricature portrait" };
+  const style = promptCache.styles[styleId] || promptCache.styles["S01"] || { prompt: "portrait" };
   const exag = promptCache.exaggeration[exaggeration] || promptCache.exaggeration["medium"] || { prompt: "" };
-  const bg = promptCache.backgrounds[background] || promptCache.backgrounds["BG01"] || { prompt: "gradient background" };
+  const bg = promptCache.backgrounds[background] || promptCache.backgrounds["BG01"] || { prompt: "" };
 
   const identityLock = promptCache.config["identity_lock"] || "";
   const technical = promptCache.config["technical"] || "";
-  const negativePrompt = promptCache.config["negative_prompt"] || "";
+  const negativePrompt = promptCache.config["negative_prompt"] || "distorted face, bad anatomy, blurry";
 
+  // Build prompt for PhotoMaker - uses 'img' trigger word
   const fullPrompt = `
-Transform the reference image into a professional caricature illustration.
-
-IDENTITY REQUIREMENTS:
-${identityLock}
-
-EXAGGERATION:
+A portrait of a person img, ${style.prompt}
 ${exag.prompt}
-
-STYLE:
-${style.prompt}
-
-BACKGROUND:
 ${bg.prompt}
-
-TECHNICAL:
 ${technical}
-`.trim();
+`.trim().replace(/\n+/g, ', ').replace(/,\s*,/g, ',');
 
   return {
     prompt: fullPrompt,
-    negative_prompt: negativePrompt
+    negative_prompt: negativePrompt,
+    style: style
   };
 }
 
-// Map frontend style IDs to backend config
-// S01A = Style S01, Mild | S01B = Style S01, Medium | S01C = Style S01, Bold
 function parseStyleId(styleId) {
   if (!styleId || styleId.length <= 3) {
     return {
@@ -158,7 +135,6 @@ function parseStyleId(styleId) {
 
   const style = styleId.substring(0, 3);
   const level = styleId.substring(3, 4);
-
   const exaggerationMap = { "A": "mild", "B": "medium", "C": "bold" };
 
   return {
@@ -196,10 +172,83 @@ async function watermarkPreview(buf) {
     .toBuffer();
 }
 
+// ============================================
+// TWO-STAGE GENERATION PIPELINE
+// ============================================
+
+// Stage 1: Generate with PhotoMaker
+async function generateWithPhotomaker(imageDataUrl, promptData, styleConfig) {
+  const modelParams = styleConfig.model_params || {};
+
+  console.log(`[Stage 1] PhotoMaker generation`);
+  console.log(`  Style: ${modelParams.style_name || 'No style'}`);
+  console.log(`  Prompt: ${promptData.prompt.substring(0, 100)}...`);
+
+  const output = await replicate.run(
+    "tencentarc/photomaker-style:467d062309da518648ba89d226490e02b8c38f7f102f54d2f9d96f194060b98f",
+    {
+      input: {
+        input_image: imageDataUrl,
+        prompt: promptData.prompt,
+        negative_prompt: promptData.negative_prompt,
+        style_name: modelParams.style_name || "(No style)",
+        style_strength_ratio: modelParams.style_strength_ratio || 30,
+        num_steps: 30,
+        guidance_scale: 5,
+        num_outputs: 1,
+        disable_safety_checker: true
+      }
+    }
+  );
+
+  const imageUrl = Array.isArray(output) ? output[0] : output;
+  if (!imageUrl) throw new Error("No image returned from PhotoMaker");
+
+  console.log(`[Stage 1] Complete: ${imageUrl}`);
+  return imageUrl;
+}
+
+// Stage 2: Upscale with Real-ESRGAN
+async function upscaleImage(imageUrl) {
+  const upscaleEnabled = promptCache.config["upscale_enabled"] === "true";
+
+  if (!upscaleEnabled) {
+    console.log(`[Stage 2] Upscaling disabled, fetching original`);
+    const response = await fetch(imageUrl);
+    return Buffer.from(await response.arrayBuffer());
+  }
+
+  const scale = parseInt(promptCache.config["upscale_scale"] || "2");
+
+  console.log(`[Stage 2] Upscaling ${scale}x with Real-ESRGAN`);
+
+  const output = await replicate.run(
+    "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
+    {
+      input: {
+        image: imageUrl,
+        scale: scale,
+        face_enhance: true
+      }
+    }
+  );
+
+  const upscaledUrl = typeof output === 'string' ? output : output?.output || output;
+  if (!upscaledUrl) throw new Error("No image returned from upscaler");
+
+  console.log(`[Stage 2] Complete: ${upscaledUrl}`);
+
+  const response = await fetch(upscaledUrl);
+  return Buffer.from(await response.arrayBuffer());
+}
+
+// Main generation function
 async function generateStylizedImage(imageBuffer, styleId, background = "BG01") {
   const config = parseStyleId(styleId);
-  const { prompt, negative_prompt } = buildPrompt(config.style, config.exaggeration, background);
+  const promptData = buildPrompt(config.style, config.exaggeration, background);
+  const styleConfig = promptCache.styles[config.style] || promptCache.styles["S01"] || {};
 
+  // Prepare input image
   const inputPng = await sharp(imageBuffer)
     .rotate()
     .resize({ width: 1024, height: 1024, fit: "cover" })
@@ -208,42 +257,27 @@ async function generateStylizedImage(imageBuffer, styleId, background = "BG01") 
 
   const dataUrl = `data:image/png;base64,${inputPng.toString("base64")}`;
 
-  console.log(`Generating: Style=${config.style}, Exaggeration=${config.exaggeration}, Background=${background}`);
+  console.log(`\n========== GENERATION START ==========`);
+  console.log(`Style: ${config.style}, Exaggeration: ${config.exaggeration}, Background: ${background}`);
 
-  const output = await replicate.run(
-    "stability-ai/sdxl:7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
-    {
-      input: {
-        image: dataUrl,
-        prompt: prompt,
-        negative_prompt: negative_prompt,
-        prompt_strength: 0.8,
-        num_inference_steps: 35,
-        guidance_scale: 9
-      }
-    }
-  );
+  // Stage 1: Generate
+  const generatedUrl = await generateWithPhotomaker(dataUrl, promptData, styleConfig);
 
-  const imageUrl = Array.isArray(output) ? output[0] : output;
-  if (!imageUrl) throw new Error("No image returned from AI model");
+  // Stage 2: Upscale
+  const upscaledBuffer = await upscaleImage(generatedUrl);
 
-  console.log("Generated image URL:", imageUrl);
+  // Add watermark
+  const watermarked = await watermarkPreview(upscaledBuffer);
 
-  const response = await fetch(imageUrl);
-  if (!response.ok) throw new Error(`Failed to fetch generated image: ${response.status}`);
+  console.log(`========== GENERATION COMPLETE ==========\n`);
 
-  const generatedBuf = Buffer.from(await response.arrayBuffer());
-  return watermarkPreview(generatedBuf);
+  return watermarked;
 }
 
 // ============================================
 // API ENDPOINTS
 // ============================================
 
-/**
- * GET /styles
- * Returns available styles, exaggeration levels, and backgrounds from database
- */
 app.get("/styles", async (req, res) => {
   res.json({
     styles: Object.entries(promptCache.styles).map(([id, data]) => ({
@@ -261,18 +295,11 @@ app.get("/styles", async (req, res) => {
   });
 });
 
-/**
- * POST /reload-prompts
- * Force reload prompts from Supabase (for admin use)
- */
 app.post("/reload-prompts", async (req, res) => {
   const success = await loadPrompts();
   res.json({ success, loaded_at: promptCache.lastLoaded });
 });
 
-/**
- * POST /projects
- */
 app.post("/projects", async (req, res) => {
   try {
     const { style_id, exaggeration, background, aspect_ratio, filename, mime_type } = req.body || {};
@@ -291,9 +318,7 @@ app.post("/projects", async (req, res) => {
         status: "created"
       });
 
-    if (dbError) {
-      console.error("DB insert error:", dbError);
-    }
+    if (dbError) console.error("DB insert error:", dbError);
 
     const host = req.get("host");
     const protocol = req.headers["x-forwarded-proto"] || req.protocol;
@@ -307,9 +332,6 @@ app.post("/projects", async (req, res) => {
   }
 });
 
-/**
- * PUT /projects/:id/upload
- */
 app.put("/projects/:id/upload", async (req, res) => {
   try {
     const { id } = req.params;
@@ -326,10 +348,7 @@ app.put("/projects/:id/upload", async (req, res) => {
         upsert: true
       });
 
-    if (uploadError) {
-      console.error("Storage upload error:", uploadError);
-      throw new Error("Failed to store image");
-    }
+    if (uploadError) throw new Error("Failed to store image");
 
     await supabase
       .from("projects")
@@ -344,13 +363,10 @@ app.put("/projects/:id/upload", async (req, res) => {
   }
 });
 
-/**
- * POST /projects/:id/upload-complete
- */
 app.post("/projects/:id/upload-complete", async (req, res) => {
   try {
     const { id } = req.params;
-    const { style_id, exaggeration, background } = req.body || {};
+    const { style_id, background } = req.body || {};
 
     const { data: project } = await supabase
       .from("projects")
@@ -367,7 +383,6 @@ app.post("/projects/:id/upload-complete", async (req, res) => {
     }
 
     const imageBuffer = Buffer.from(await imageData.arrayBuffer());
-
     const finalStyleId = style_id || project?.style_id || "S01";
     const finalBackground = background || project?.background || "BG01";
 
@@ -383,10 +398,7 @@ app.post("/projects/:id/upload-complete", async (req, res) => {
         upsert: true
       });
 
-    if (previewUploadError) {
-      console.error("Preview upload error:", previewUploadError);
-      throw new Error("Failed to store preview");
-    }
+    if (previewUploadError) throw new Error("Failed to store preview");
 
     const { data: urlData } = supabase.storage
       .from("previews")
@@ -412,9 +424,6 @@ app.post("/projects/:id/upload-complete", async (req, res) => {
   }
 });
 
-/**
- * GET /projects/:id
- */
 app.get("/projects/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -441,7 +450,6 @@ app.get("/projects/:id", async (req, res) => {
 // ============================================
 
 async function initSupabase() {
-  // Create storage buckets
   const buckets = ["uploads", "previews"];
   for (const bucket of buckets) {
     const { error } = await supabase.storage.createBucket(bucket, {
@@ -457,7 +465,6 @@ async function initSupabase() {
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize everything then start server
 Promise.all([initSupabase(), loadPrompts()])
   .then(() => {
     app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
