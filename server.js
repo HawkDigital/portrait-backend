@@ -185,7 +185,7 @@ async function generateWithPhotomaker(imageDataUrl, promptData, styleConfig) {
   console.log(`  Prompt: ${promptData.prompt.substring(0, 100)}...`);
 
   const output = await replicate.run(
-    "tencentarc/photomaker-style:467d062309da518648ba89d226490e02b8c38f7f102f54d2f9d96f194060b98f",
+    "tencentarc/photomaker-style",
     {
       input: {
         input_image: imageDataUrl,
@@ -223,7 +223,7 @@ async function upscaleImage(imageUrl) {
   console.log(`[Stage 2] Upscaling ${scale}x with Real-ESRGAN`);
 
   const output = await replicate.run(
-    "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
+    "nightmareai/real-esrgan",
     {
       input: {
         image: imageUrl,
