@@ -176,6 +176,23 @@ async function watermarkPreview(buf) {
 // TWO-STAGE GENERATION PIPELINE
 // ============================================
 
+// Retry helper for rate limits
+async function runWithRetry(fn, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.message?.includes('429') && attempt < maxRetries) {
+        const waitTime = Math.pow(2, attempt) * 5000; // 10s, 20s, 40s
+        console.log(`Rate limited, waiting ${waitTime/1000}s before retry ${attempt + 1}/${maxRetries}...`);
+        await new Promise(r => setTimeout(r, waitTime));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 // Stage 1: Generate with PhotoMaker
 async function generateWithPhotomaker(imageDataUrl, promptData, styleConfig) {
   const modelParams = styleConfig.model_params || {};
@@ -184,7 +201,7 @@ async function generateWithPhotomaker(imageDataUrl, promptData, styleConfig) {
   console.log(`  Style: ${modelParams.style_name || 'No style'}`);
   console.log(`  Prompt: ${promptData.prompt.substring(0, 100)}...`);
 
-  const output = await replicate.run(
+  const output = await runWithRetry(() => replicate.run(
     "tencentarc/photomaker-style:467d062309da518648ba89d226490e02b8ed09b5abc15026e54e31c5a8cd0769",
     {
       input: {
@@ -199,7 +216,7 @@ async function generateWithPhotomaker(imageDataUrl, promptData, styleConfig) {
         disable_safety_checker: true
       }
     }
-  );
+  ));
 
   const imageUrl = Array.isArray(output) ? output[0] : output;
   if (!imageUrl) throw new Error("No image returned from PhotoMaker");
@@ -222,7 +239,7 @@ async function upscaleImage(imageUrl) {
 
   console.log(`[Stage 2] Upscaling ${scale}x with Real-ESRGAN`);
 
-  const output = await replicate.run(
+  const output = await runWithRetry(() => replicate.run(
     "nightmareai/real-esrgan:b3ef194191d13140337468c916c2c5b96dd0cb06dffc032a022a31807f6a5ea8",
     {
       input: {
@@ -231,7 +248,7 @@ async function upscaleImage(imageUrl) {
         face_enhance: true
       }
     }
-  );
+  ));
 
   const upscaledUrl = typeof output === 'string' ? output : output?.output || output;
   if (!upscaledUrl) throw new Error("No image returned from upscaler");
