@@ -25,77 +25,219 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SECRET_KEY) {
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
-// Initialize storage buckets (run once on startup)
+// Initialize storage buckets
 async function initSupabase() {
-  // Create buckets if they don't exist
   const buckets = ["uploads", "previews"];
   for (const bucket of buckets) {
     const { error } = await supabase.storage.createBucket(bucket, {
       public: true,
-      fileSizeLimit: 15 * 1024 * 1024 // 15MB
+      fileSizeLimit: 15 * 1024 * 1024
     });
     if (error && !error.message.includes("already exists")) {
       console.error(`Failed to create bucket ${bucket}:`, error.message);
     }
   }
-
-  // Create projects table if it doesn't exist
-  const { error: tableError } = await supabase.rpc('create_projects_table_if_not_exists').catch(() => ({}));
-  // Table creation will be handled via Supabase dashboard if RPC doesn't exist
-
   console.log("Supabase initialized");
 }
 
-// Style prompts - supports both main styles (S01) and substyles (S01A, S01B, S01C)
-const STYLE_PROMPTS = {
-  // Caricature
-  S01: { prompt: "caricature portrait, exaggerated features, fun cartoon style", negative: "realistic, photograph" },
-  S01A: { prompt: "classic caricature portrait, traditional caricature art, exaggerated features, fun expressive style", negative: "realistic, photograph, serious" },
-  S01B: { prompt: "extremely exaggerated caricature, very big head, tiny body, humorous cartoon style, bold lines", negative: "realistic, subtle, photograph" },
-  S01C: { prompt: "subtle caricature portrait, slightly stylized features, gentle exaggeration, tasteful cartoon", negative: "extreme, grotesque, realistic photo" },
+// ============================================
+// PROMPT SYSTEM
+// ============================================
 
-  // Cartoon
-  S02: { prompt: "modern cartoon portrait, clean lines, vibrant colors", negative: "realistic, photograph" },
-  S02A: { prompt: "pixar style 3D cartoon portrait, smooth rendering, big expressive eyes, friendly character design", negative: "2D, flat, realistic, anime" },
-  S02B: { prompt: "anime portrait, japanese animation style, big eyes, colorful hair highlights, manga inspired", negative: "western cartoon, realistic, 3D" },
-  S02C: { prompt: "flat design cartoon portrait, minimal shading, bold solid colors, vector art style, simple shapes", negative: "3D, detailed shading, realistic" },
+// Core Identity Lock Block - preserves likeness
+const IDENTITY_LOCK = `
+Use the reference image as the primary identity source.
+Preserve:
+- Exact facial structure
+- Eye shape and spacing
+- Nose base structure
+- Lip shape
+- Hairline and hairstyle
+- Skin tone
+- Ethnicity
+- Facial hair details
+- Expression essence
+Exaggerate features but do NOT change identity.
+The person must remain immediately recognisable.
+`;
 
-  // Line Art
-  S03: { prompt: "line art portrait, ink drawing, clean lines", negative: "colored, painted, photograph" },
-  S03A: { prompt: "minimal line art portrait, single continuous line, elegant simplicity, white background, delicate strokes", negative: "detailed, shaded, colored, complex" },
-  S03B: { prompt: "detailed line art portrait, intricate ink drawing, fine linework, crosshatching, pen illustration", negative: "minimal, simple, colored" },
-  S03C: { prompt: "pencil sketch portrait, loose gestural drawing, artistic sketch marks, graphite texture", negative: "clean lines, digital, colored" },
-
-  // Vintage
-  S04: { prompt: "vintage portrait, retro photography style", negative: "modern, digital, colorful" },
-  S04A: { prompt: "film noir portrait, high contrast black and white, dramatic shadows, 1940s detective movie style", negative: "colorful, bright, modern" },
-  S04B: { prompt: "sepia tone vintage portrait, old photograph style, warm brown tones, antique feeling, faded edges", negative: "modern, colorful, sharp" },
-  S04C: { prompt: "1970s retro portrait, warm film grain, golden hour lighting, vintage color photography, nostalgic", negative: "modern, digital, cold tones" },
-
-  // Watercolour
-  S05: { prompt: "watercolor portrait painting, soft washes, artistic", negative: "digital, sharp, photograph" },
-  S05A: { prompt: "soft watercolor portrait, gentle washes, delicate blending, light pastel tones, dreamy ethereal", negative: "bold, saturated, digital" },
-  S05B: { prompt: "bold watercolor portrait, vibrant splashes, expressive brush strokes, saturated colors, dynamic", negative: "subtle, pale, controlled" },
-  S05C: { prompt: "pastel watercolor portrait, muted soft colors, gentle palette, peaceful serene mood, light washes", negative: "vibrant, bold, saturated" },
-
-  // Comic
-  S06: { prompt: "comic book portrait, bold lines, dynamic style", negative: "realistic, photograph, soft" },
-  S06A: { prompt: "superhero comic portrait, bold ink lines, dramatic lighting, marvel dc style, heroic pose, halftone dots", negative: "manga, soft, realistic" },
-  S06B: { prompt: "manga portrait, japanese comic style, speed lines, expressive eyes, black and white ink, screentone", negative: "western comic, colored, realistic" },
-  S06C: { prompt: "graphic novel portrait, artistic comic style, moody noir shading, sophisticated illustration", negative: "cartoon, bright colors, childish" },
-
-  // Oil Painting
-  S07: { prompt: "oil painting portrait, classical art, rich textures", negative: "digital, photograph, flat" },
-  S07A: { prompt: "renaissance oil portrait, classical master painting, dramatic chiaroscuro, museum quality, ornate gold frame style", negative: "modern, flat, digital" },
-  S07B: { prompt: "impressionist oil portrait, visible brush strokes, dappled light, monet renoir style, soft colors", negative: "sharp, photorealistic, flat" },
-  S07C: { prompt: "modern oil painting portrait, contemporary art style, bold brush strokes, expressive colors, gallery art", negative: "classical, traditional, photograph" },
-
-  // Pop Art
-  S08: { prompt: "pop art portrait, bold colors, graphic style", negative: "realistic, muted, photograph" },
-  S08A: { prompt: "andy warhol style pop art portrait, bright flat colors, screen print effect, repetition, iconic", negative: "realistic, painterly, subtle" },
-  S08B: { prompt: "roy lichtenstein pop art portrait, ben day dots, comic book style, bold outlines, primary colors, speech bubble", negative: "realistic, soft, painterly" },
-  S08C: { prompt: "neon pop art portrait, vibrant glowing colors, fluorescent palette, electric blue pink green, synthwave", negative: "muted, realistic, traditional" }
+// Exaggeration Levels
+const EXAGGERATION_LEVELS = {
+  mild: `
+Mild exaggeration level.
+Enlarge head slightly (120-130%).
+Subtle exaggeration of most distinctive feature.
+Keep proportions mostly natural.
+`,
+  medium: `
+Medium exaggeration level.
+Head 140-150%.
+Emphasise defining traits.
+Widen smile.
+Slightly enlarge eyes.
+Increase nose length or width if distinctive.
+`,
+  bold: `
+Bold exaggeration level.
+Head 160%.
+Push facial contrast.
+Strong mouth exaggeration.
+Elongated nose or jawline if appropriate.
+More animated expression.
+Still recognisable, not grotesque.
+`
 };
+
+// Style Definitions
+const STYLES = {
+  S01: {
+    name: "Classic Street Caricature",
+    prompt: `
+Professional street caricature illustration.
+Thick confident black linework.
+Smooth airbrushed shading.
+Vibrant carnival colour palette.
+Playful exaggerated expression.
+Digital painting, semi-realistic shading.
+Clean white highlight accents.
+`
+  },
+  S02: {
+    name: "Premium Gallery Caricature",
+    prompt: `
+High-end painterly caricature portrait.
+Visible brush texture.
+Soft blended shading.
+Muted but rich colour palette.
+Studio lighting.
+Caricature exaggeration with refined realism.
+Subtle texture overlay.
+Elegant artistic finish.
+`
+  },
+  S03: {
+    name: "Bold Comic Line Caricature",
+    prompt: `
+High-contrast comic-style caricature.
+Thick bold outlines.
+Sharp shadows.
+Slight halftone texture.
+Bright saturated colours.
+Dynamic expression.
+Graphic poster-like finish.
+`
+  },
+  S04: {
+    name: "Soft Digital Cartoon",
+    prompt: `
+Soft digital cartoon caricature.
+Rounded lines.
+Gentle shading.
+Pastel colour palette.
+Warm cheerful expression.
+Smooth gradients.
+Family-friendly style.
+`
+  },
+  S05: {
+    name: "Ultra Airbrush Hyper Caricature",
+    prompt: `
+Highly exaggerated airbrush caricature.
+Glossy skin highlights.
+High saturation.
+Extreme smile enhancement.
+Dramatic lighting.
+Large expressive eyes.
+Ultra-clean finish.
+`
+  }
+};
+
+// Background Definitions
+const BACKGROUNDS = {
+  BG01: "Soft sky blue gradient background, subtle vignette.",
+  BG02: "Warm peach to light orange gradient background.",
+  BG03: "Pure white background, studio look.",
+  BG04: "Soft blurred fairground background, shallow depth of field.",
+  BG05: "Neutral beige studio gradient."
+};
+
+// Technical Requirements
+const TECHNICAL_BLOCK = `
+High resolution.
+Ultra clean linework.
+Smooth colour blending.
+Print-ready quality.
+Professional finish.
+Maintain likeness accuracy.
+`;
+
+// Consistency Enhancers (Negative Prompt)
+const NEGATIVE_PROMPT = `
+distorted beyond recognition, generic cartoon, anime style, pixar style,
+3D render, photorealistic, blurry, low quality, bad anatomy,
+deformed face, extra limbs, watermark, signature, text
+`;
+
+// Build the full prompt from components
+function buildPrompt(styleId, exaggeration = "medium", background = "BG01") {
+  const style = STYLES[styleId] || STYLES.S01;
+  const exaggerationBlock = EXAGGERATION_LEVELS[exaggeration] || EXAGGERATION_LEVELS.medium;
+  const backgroundBlock = BACKGROUNDS[background] || BACKGROUNDS.BG01;
+
+  const fullPrompt = `
+Transform the reference image into a professional caricature illustration.
+
+IDENTITY REQUIREMENTS:
+${IDENTITY_LOCK}
+
+EXAGGERATION:
+${exaggerationBlock}
+
+STYLE:
+${style.prompt}
+
+BACKGROUND:
+${backgroundBlock}
+
+TECHNICAL:
+${TECHNICAL_BLOCK}
+`.trim();
+
+  return {
+    prompt: fullPrompt,
+    negative_prompt: NEGATIVE_PROMPT
+  };
+}
+
+// Map frontend style IDs to backend config
+// S01A = Style S01, Mild | S01B = Style S01, Medium | S01C = Style S01, Bold
+function parseStyleId(styleId) {
+  // Handle legacy format (S01, S02, etc.)
+  if (!styleId || styleId.length <= 3) {
+    return {
+      style: styleId || "S01",
+      exaggeration: "medium",
+      background: "BG01"
+    };
+  }
+
+  // Handle new format (S01A, S01B, S01C)
+  const style = styleId.substring(0, 3); // S01, S02, etc.
+  const level = styleId.substring(3, 4); // A, B, or C
+
+  const exaggerationMap = {
+    "A": "mild",
+    "B": "medium",
+    "C": "bold"
+  };
+
+  return {
+    style: style,
+    exaggeration: exaggerationMap[level] || "medium",
+    background: "BG01" // Default, can be passed separately
+  };
+}
 
 // Watermark helper
 async function watermarkPreview(buf) {
@@ -123,8 +265,9 @@ async function watermarkPreview(buf) {
 }
 
 // Generate the AI image
-async function generateStylizedImage(imageBuffer, styleId) {
-  const style = STYLE_PROMPTS[styleId] || STYLE_PROMPTS["S01"];
+async function generateStylizedImage(imageBuffer, styleId, background = "BG01") {
+  const config = parseStyleId(styleId);
+  const { prompt, negative_prompt } = buildPrompt(config.style, config.exaggeration, background);
 
   const inputPng = await sharp(imageBuffer)
     .rotate()
@@ -134,17 +277,18 @@ async function generateStylizedImage(imageBuffer, styleId) {
 
   const dataUrl = `data:image/png;base64,${inputPng.toString("base64")}`;
 
-  console.log(`Processing style ${styleId}: "${style.prompt}"`);
+  console.log(`Generating: Style=${config.style}, Exaggeration=${config.exaggeration}, Background=${background}`);
+  console.log(`Prompt preview: ${prompt.substring(0, 200)}...`);
 
   const output = await replicate.run(
     "stability-ai/sdxl:7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
     {
       input: {
         image: dataUrl,
-        prompt: `portrait of a person, ${style.prompt}, high quality, detailed`,
-        negative_prompt: style.negative || "blurry, low quality, distorted",
-        prompt_strength: 0.6,
-        num_inference_steps: 25,
+        prompt: prompt,
+        negative_prompt: negative_prompt,
+        prompt_strength: 0.65,
+        num_inference_steps: 30,
         guidance_scale: 7.5
       }
     }
@@ -162,22 +306,43 @@ async function generateStylizedImage(imageBuffer, styleId) {
   return watermarkPreview(generatedBuf);
 }
 
+// ============================================
+// API ENDPOINTS
+// ============================================
+
+/**
+ * GET /styles
+ * Returns available styles, exaggeration levels, and backgrounds
+ */
+app.get("/styles", (req, res) => {
+  res.json({
+    styles: Object.entries(STYLES).map(([id, data]) => ({
+      id,
+      name: data.name
+    })),
+    exaggeration_levels: ["mild", "medium", "bold"],
+    backgrounds: Object.entries(BACKGROUNDS).map(([id, description]) => ({
+      id,
+      description
+    }))
+  });
+});
+
 /**
  * POST /projects
- * body: { style_id, aspect_ratio, filename, mime_type }
- * returns: { project_id, upload_url }
  */
 app.post("/projects", async (req, res) => {
   try {
-    const { style_id, aspect_ratio, filename, mime_type } = req.body || {};
+    const { style_id, exaggeration, background, aspect_ratio, filename, mime_type } = req.body || {};
     const project_id = uuidv4();
 
-    // Store project in Supabase
     const { error: dbError } = await supabase
       .from("projects")
       .insert({
         id: project_id,
         style_id: style_id || "S01",
+        exaggeration: exaggeration || "medium",
+        background: background || "BG01",
         aspect_ratio: aspect_ratio || "2:3",
         filename,
         mime_type,
@@ -186,7 +351,6 @@ app.post("/projects", async (req, res) => {
 
     if (dbError) {
       console.error("DB insert error:", dbError);
-      // Continue anyway - storage will still work
     }
 
     const host = req.get("host");
@@ -203,7 +367,6 @@ app.post("/projects", async (req, res) => {
 
 /**
  * PUT /projects/:id/upload
- * Accepts raw image file, stores in Supabase
  */
 app.put("/projects/:id/upload", async (req, res) => {
   try {
@@ -213,7 +376,6 @@ app.put("/projects/:id/upload", async (req, res) => {
       return res.status(400).json({ error: "No file data received" });
     }
 
-    // Upload to Supabase storage
     const filePath = `${id}/original.jpg`;
     const { error: uploadError } = await supabase.storage
       .from("uploads")
@@ -227,7 +389,6 @@ app.put("/projects/:id/upload", async (req, res) => {
       throw new Error("Failed to store image");
     }
 
-    // Update project status
     await supabase
       .from("projects")
       .update({ status: "uploaded" })
@@ -243,22 +404,18 @@ app.put("/projects/:id/upload", async (req, res) => {
 
 /**
  * POST /projects/:id/upload-complete
- * Triggers AI generation, stores result in Supabase
- * returns: { preview_url }
  */
 app.post("/projects/:id/upload-complete", async (req, res) => {
   try {
     const { id } = req.params;
-    const { style_id } = req.body || {};
+    const { style_id, exaggeration, background } = req.body || {};
 
-    // Get project from database
     const { data: project } = await supabase
       .from("projects")
       .select("*")
       .eq("id", id)
       .single();
 
-    // Download uploaded image from Supabase storage
     const { data: imageData, error: downloadError } = await supabase.storage
       .from("uploads")
       .download(`${id}/original.jpg`);
@@ -268,13 +425,15 @@ app.post("/projects/:id/upload-complete", async (req, res) => {
     }
 
     const imageBuffer = Buffer.from(await imageData.arrayBuffer());
+
+    // Use request params or fall back to stored project params
     const finalStyleId = style_id || project?.style_id || "S01";
+    const finalBackground = background || project?.background || "BG01";
 
-    console.log(`Generating preview for project ${id} with style ${finalStyleId}`);
+    console.log(`Generating preview for project ${id}`);
 
-    const previewBuffer = await generateStylizedImage(imageBuffer, finalStyleId);
+    const previewBuffer = await generateStylizedImage(imageBuffer, finalStyleId, finalBackground);
 
-    // Upload preview to Supabase storage
     const previewPath = `${id}/preview.jpg`;
     const { error: previewUploadError } = await supabase.storage
       .from("previews")
@@ -288,20 +447,19 @@ app.post("/projects/:id/upload-complete", async (req, res) => {
       throw new Error("Failed to store preview");
     }
 
-    // Get public URL for preview
     const { data: urlData } = supabase.storage
       .from("previews")
       .getPublicUrl(previewPath);
 
     const preview_url = urlData.publicUrl;
 
-    // Update project status
     await supabase
       .from("projects")
       .update({
         status: "preview_ready",
         preview_url,
-        style_id: finalStyleId
+        style_id: finalStyleId,
+        background: finalBackground
       })
       .eq("id", id);
 
@@ -315,7 +473,6 @@ app.post("/projects/:id/upload-complete", async (req, res) => {
 
 /**
  * GET /projects/:id
- * Get project status and details
  */
 app.get("/projects/:id", async (req, res) => {
   try {
@@ -340,11 +497,9 @@ app.get("/projects/:id", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize Supabase then start server
 initSupabase().then(() => {
   app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
 }).catch(err => {
   console.error("Failed to initialize Supabase:", err);
-  // Start anyway - might work without bucket creation
   app.listen(PORT, () => console.log(`Server listening on ${PORT} (Supabase init failed)`));
 });
